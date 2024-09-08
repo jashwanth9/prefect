@@ -1,7 +1,12 @@
+from uuid import UUID
+
 import pendulum
 import pytest
+import sqlalchemy as sa
+from sqlalchemy.sql.expression import or_
 
 from prefect.server import models, schemas
+from prefect.server.database import orm_models
 from prefect.server.schemas import states
 from prefect.server.services.cancellation_cleanup import CancellationCleanup
 
@@ -44,6 +49,34 @@ async def old_cancelled_flow_run(session, flow):
                 flow_id=flow.id, state=states.Cancelled(), end_time=THE_ANCIENT_PAST
             ),
         )
+
+
+@pytest.fixture
+async def all_states_subflow_run(session, flow, flow_run):
+    async with session.begin():
+        cancelling_parent_task_run = await models.task_runs.create_task_run(
+            session=session,
+            task_run=schemas.core.TaskRun(
+                flow_run_id=flow_run.id,
+                task_key="a cancelling parent task",
+                dynamic_key="a cancelling parent dynamic key",
+                state=states.Cancelling(),
+            ),
+        )
+        combined_state_subflow_constructors = {
+            **NON_TERMINAL_STATE_CONSTRUCTORS,
+            **TERMINAL_STATE_CONSTRUCTORS,
+        }
+        for _, state_constructor in combined_state_subflow_constructors.items():
+            await models.flow_runs.create_flow_run(
+                session=session,
+                flow_run=schemas.core.FlowRun(
+                    flow_id=flow.id,
+                    state=state_constructor(),
+                    parent_task_run_id=cancelling_parent_task_run.id,
+                ),
+            )
+    return cancelling_parent_task_run
 
 
 @pytest.fixture
@@ -233,3 +266,35 @@ async def test_service_leaves_terminal_runs_alone(
     assert orphaned_task_run.state.type == state_constructor[0]
     assert orphaned_subflow_run.state.type == state_constructor[0]
     assert orphaned_subflow_run_from_deployment.state.type == state_constructor[0]
+
+
+async def test_clean_up_cancelled_subflow_runs(session, all_states_subflow_run):
+    cancelling_parent_task_run = all_states_subflow_run
+
+    high_water_mark = UUID(int=0)
+    fetch_subflows_query = (
+        sa.select(orm_models.FlowRun)
+        .where(
+            or_(
+                orm_models.FlowRun.state_type == states.StateType.PENDING,
+                orm_models.FlowRun.state_type == states.StateType.SCHEDULED,
+                orm_models.FlowRun.state_type == states.StateType.RUNNING,
+                orm_models.FlowRun.state_type == states.StateType.PAUSED,
+                orm_models.FlowRun.state_type == states.StateType.CANCELLING,
+            ),
+            orm_models.FlowRun.id > high_water_mark,
+            orm_models.FlowRun.parent_task_run_id.is_not(None),
+        )
+        .order_by(orm_models.FlowRun.id)
+        .limit(10)
+    )
+
+    async with session.begin():
+        result = await session.execute(fetch_subflows_query)
+        result = result.scalars().all()
+
+    assert len(result) == 5
+    assert all(
+        subflow.parent_task_run_id == cancelling_parent_task_run.id
+        for subflow in result
+    )
